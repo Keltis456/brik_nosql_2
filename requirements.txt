@@ -1,0 +1,21 @@
+# Semantic Search over Scientific Articles - dependencies
+# Version floors chosen so prebuilt wheels exist for Python 3.13 (no source builds).
+
+# Core pipeline
+pinecone-client>=4.1.1,<6
+sentence-transformers>=3.0.1
+rank-bm25>=0.2.2
+kaggle>=1.6.17
+pandas>=2.2.3
+numpy>=2.1.0
+tqdm>=4.66.4
+pyarrow>=18.0.0
+python-dotenv>=1.0.1
+
+# Pulled in by sentence-transformers (Python 3.13 needs torch >= 2.5).
+transformers>=4.44.0
+torch>=2.5.0
+
+# Optional helpers (sentence tokenizer, light utilities).
+nltk>=3.9
+scikit-learn>=1.5.1

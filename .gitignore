@@ -1,0 +1,31 @@
+# Secrets
+.env
+
+# Generated artifacts
+embeddings/*.npy
+embeddings/*.json
+data/*.parquet
+
+# Keep folder placeholders
+!embeddings/.gitkeep
+!data/.gitkeep
+
+# Large / raw data dumps (match at repo root or under data/)
+arxiv-metadata-oai-snapshot.json
+*.json
+*.jsonl.gz
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
