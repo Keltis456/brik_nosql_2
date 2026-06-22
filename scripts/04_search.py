@@ -128,17 +128,66 @@ def print_results(title: str, matches) -> None:
         )
 
 
+# Built-in queries used when the script is run with no -q (pipeline demo).
+DEFAULT_DEMO_QUERIES = [
+    "graph neural networks for molecular property prediction",
+    "retrieval augmented generation for question answering",
+    "quantum error correction surface code",
+]
+
+
+def _run_semantic(backend, query_vec, query, top_k):
+    matches = backend.search(query_vec, top_k=top_k, flt=None, metric="cosine")
+    print_results(f"Semantic search: {query!r}", matches)
+
+
+def _run_filtered(backend, query_vec, query, top_k, flt):
+    log.info("Applying metadata filter: %s", flt)
+    matches = backend.search(query_vec, top_k=top_k, flt=flt, metric="cosine")
+    print_results(f"Semantic + filter ({flt}): {query!r}", matches)
+
+
+def _run_metric(backend, query_vec, query, top_k):
+    # Metric comparison fully applies to the LOCAL index, where we re-score with
+    # each metric. For Pinecone the metric is fixed at index creation, so we note
+    # that and only run cosine there.
+    for metric in ("cosine", "dotproduct", "euclidean"):
+        if not backend.use_local and metric != "cosine":
+            print(f"\n[skipped {metric}: Pinecone index metric is fixed at creation]")
+            continue
+        matches = backend.search(query_vec, top_k=top_k, flt=None, metric=metric)
+        print_results(f"metric={metric}: {query!r}", matches)
+
+
+def _print_metric_discussion() -> None:
+    print(
+        "\n--- Metric discussion (cosine vs dot vs euclidean) ---\n"
+        "All vectors are L2-normalized in 02_embed, so they lie on the unit\n"
+        "hypersphere and the three metrics induce the SAME ranking:\n"
+        "  cosine(a,b)      = a.b           (because |a|=|b|=1)\n"
+        "  dotproduct(a,b)  = a.b           (identical to cosine here)\n"
+        "  euclidean(a,b)^2 = 2 - 2*(a.b)   (smaller distance <=> larger dot)\n"
+        "Scores differ, order is identical. SPECTER2 is trained with a cosine\n"
+        "objective, which is why we normalize and use cosine. Without\n"
+        "normalization, dotproduct would reward longer vectors and could\n"
+        "disagree with cosine."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-q", "--query", required=True, help="Natural-language query.")
-    parser.add_argument("--mode", choices=["semantic", "filtered", "metric"], default="semantic")
+    parser.add_argument(
+        "-q", "--query", default=None,
+        help="Natural-language query. If omitted, runs a built-in demo across all three modes.",
+    )
+    parser.add_argument("--mode", choices=["semantic", "filtered", "metric", "all"], default="all")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--year-min", type=int, default=None)
     parser.add_argument("--year-max", type=int, default=None)
     parser.add_argument("--category", default=None)
     args = parser.parse_args()
 
-    # Embed the query with the SAME model used at indexing time.
+    # Embed queries with the SAME model used at indexing time.
     model_info = load_model_info()
     model = load_embedding_model()
     if model.dim != int(model_info["dim"]):
@@ -148,50 +197,34 @@ def main() -> int:
             model.dim,
             model_info["dim"],
         )
-    query_vec = model.encode([args.query], normalize=True)[0]
 
     backend = Backend()
 
-    if args.mode == "semantic":
-        matches = backend.search(query_vec, top_k=args.top_k, flt=None, metric="cosine")
-        print_results(f"Semantic search: {args.query!r}", matches)
+    def embed(q):
+        return model.encode([q], normalize=True)[0]
 
-    elif args.mode == "filtered":
+    # ---- demo mode: no query supplied, exercise all three modes ---------- #
+    if args.query is None:
+        log.info("No -q provided; running built-in demo across all three modes.")
+        for q in DEFAULT_DEMO_QUERIES:
+            _run_semantic(backend, embed(q), q, args.top_k)
+        q_filt = DEFAULT_DEMO_QUERIES[0]
+        _run_filtered(backend, embed(q_filt), q_filt, args.top_k, build_filter(2024, None, None))
+        q_metric = DEFAULT_DEMO_QUERIES[2]
+        _run_metric(backend, embed(q_metric), q_metric, args.top_k)
+        _print_metric_discussion()
+        return 0
+
+    # ---- single-query mode ----------------------------------------------- #
+    query_vec = embed(args.query)
+    if args.mode in ("semantic", "all"):
+        _run_semantic(backend, query_vec, args.query, args.top_k)
+    if args.mode in ("filtered", "all"):
         flt = build_filter(args.year_min, args.year_max, args.category)
-        log.info("Applying metadata filter: %s", flt)
-        matches = backend.search(query_vec, top_k=args.top_k, flt=flt, metric="cosine")
-        print_results(f"Semantic + filter ({flt}): {args.query!r}", matches)
-
-    elif args.mode == "metric":
-        # Metric comparison only fully applies to the LOCAL index, where we can
-        # re-score with each metric. For Pinecone the metric is fixed at index
-        # creation, so we note that and only run cosine there.
-        for metric in ("cosine", "dotproduct", "euclidean"):
-            if not backend.use_local and metric != "cosine":
-                print(f"\n[skipped {metric}: Pinecone index metric is fixed at creation]")
-                continue
-            matches = backend.search(query_vec, top_k=args.top_k, flt=None, metric=metric)
-            print_results(f"metric={metric}: {args.query!r}", matches)
-
-        # ----------------------------------------------------------------- #
-        # DISCUSSION (cosine vs dot vs euclidean)
-        # ----------------------------------------------------------------- #
-        # We L2-normalize every vector in 02_embed, so all embeddings lie on the
-        # unit hypersphere. On that sphere the three metrics are monotonically
-        # related and therefore induce the SAME ranking:
-        #
-        #   * cosine(a,b)      = a·b           (because |a|=|b|=1)
-        #   * dotproduct(a,b)  = a·b           (identical to cosine here)
-        #   * euclidean(a,b)^2 = 2 - 2·(a·b)   (so smaller distance <=> larger dot)
-        #
-        # The SCORES differ (cosine/dot in [-1,1]; euclidean is a distance), but
-        # the ORDER of neighbours is identical. SPECTER2 is trained with a
-        # cosine/contrastive objective, which is exactly why we normalize and
-        # use cosine: it matches how the model learned its geometry.
-        #
-        # If vectors were NOT normalized, dotproduct would reward longer vectors
-        # (favouring "popular"/high-magnitude items) and could disagree with
-        # cosine - that is the situation to watch out for with raw embeddings.
+        _run_filtered(backend, query_vec, args.query, args.top_k, flt)
+    if args.mode in ("metric", "all"):
+        _run_metric(backend, query_vec, args.query, args.top_k)
+        _print_metric_discussion()
 
     return 0
 

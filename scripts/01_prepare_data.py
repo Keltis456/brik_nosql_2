@@ -55,7 +55,11 @@ from tqdm import tqdm
 # --------------------------------------------------------------------------- #
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
-DEFAULT_REAL_INPUT = DATA_DIR / "arxiv-metadata-oai-snapshot.json"
+# The Kaggle unzip drops the dump either in the repo root or in data/.
+DEFAULT_REAL_CANDIDATES = [
+    ROOT / "arxiv-metadata-oai-snapshot.json",
+    DATA_DIR / "arxiv-metadata-oai-snapshot.json",
+]
 SAMPLE_INPUT = DATA_DIR / "sample.jsonl"
 DEFAULT_OUTPUT = DATA_DIR / "arxiv_subset.parquet"
 
@@ -148,26 +152,19 @@ def iter_records(path: Path) -> Iterator[dict]:
 # --------------------------------------------------------------------------- #
 # Core
 # --------------------------------------------------------------------------- #
-def build_subset(
+def _iter_valid_rows(
     input_path: Path,
-    max_records: int,
     min_abstract_chars: int,
     categories: list[str] | None,
-) -> pd.DataFrame:
-    rows: list[dict] = []
+) -> Iterator[dict]:
+    """Yield cleaned, de-duplicated rows that pass the filters."""
     seen_ids: set[str] = set()
-
-    # tqdm gives a live progress bar; total is unknown for a streamed JSONL, so
-    # we drive it by the number of accepted rows toward max_records.
-    progress = tqdm(total=max_records, desc="Selecting records", unit="rec")
-
     for record in iter_records(input_path):
         arxiv_id = _clean_text(record.get("id"))
         title = _clean_text(record.get("title"))
         abstract = _clean_text(record.get("abstract"))
         category = _primary_category(record)
 
-        # ---- cleaning / filtering rules ---------------------------------- #
         if not arxiv_id or arxiv_id in seen_ids:
             continue
         if not title or len(abstract) < min_abstract_chars:
@@ -175,24 +172,60 @@ def build_subset(
         if categories and category not in categories:
             continue
 
-        rows.append(
-            {
-                "id": arxiv_id,
-                "title": title,
-                "abstract": abstract,
-                "authors": _normalize_authors(record),
-                "year": _parse_year(record),
-                "category": category,
-            }
-        )
         seen_ids.add(arxiv_id)
-        progress.update(1)
+        yield {
+            "id": arxiv_id,
+            "title": title,
+            "abstract": abstract,
+            "authors": _normalize_authors(record),
+            "year": _parse_year(record),
+            "category": category,
+        }
 
-        if len(rows) >= max_records:
-            log.info("Reached max_records=%d, stopping early.", max_records)
-            break
 
-    progress.close()
+def build_subset(
+    input_path: Path,
+    max_records: int,
+    min_abstract_chars: int,
+    categories: list[str] | None,
+    sample: str = "reservoir",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Build a subset DataFrame.
+
+    sample="head"      : take the first N valid records (fast, but the Kaggle
+                         dump is ordered oldest-first, so you get only the
+                         earliest year).
+    sample="reservoir" : single-pass uniform random sample across the WHOLE
+                         dump (Algorithm R). Spans every year/category, which
+                         makes the downstream search demos meaningful. Reads the
+                         entire file once, so it is slower (a minute or two).
+    """
+    rows_iter = _iter_valid_rows(input_path, min_abstract_chars, categories)
+
+    if sample == "head":
+        rows: list[dict] = []
+        for row in tqdm(rows_iter, total=max_records, desc="Selecting (head)", unit="rec"):
+            rows.append(row)
+            if len(rows) >= max_records:
+                log.info("Reached max_records=%d, stopping early.", max_records)
+                break
+    else:
+        import random
+
+        rng = random.Random(seed)
+        rows = []
+        n_seen = 0
+        for row in tqdm(rows_iter, desc="Reservoir sampling (full scan)", unit="rec"):
+            n_seen += 1
+            if len(rows) < max_records:
+                rows.append(row)
+            else:
+                j = rng.randint(0, n_seen - 1)
+                if j < max_records:
+                    rows[j] = row
+        log.info("Reservoir sampled %d of %d valid records (spans all years).", len(rows), n_seen)
 
     df = pd.DataFrame(rows, columns=["id", "title", "abstract", "authors", "year", "category"])
     # Year may be missing for a few records; fill with a sentinel and cast.
@@ -211,6 +244,13 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output parquet path.")
     parser.add_argument("--max-records", type=int, default=8000, help="Subset size (target 5k-10k).")
+    parser.add_argument(
+        "--sample",
+        choices=["reservoir", "head"],
+        default="reservoir",
+        help="reservoir = uniform sample across the whole dump (spans all years, slower); "
+        "head = first N records (fast, but only the earliest year).",
+    )
     parser.add_argument("--min-abstract-chars", type=int, default=80, help="Drop too-short abstracts.")
     parser.add_argument(
         "--categories",
@@ -221,10 +261,11 @@ def main() -> int:
     args = parser.parse_args()
 
     # ---- resolve input with graceful fallback ---------------------------- #
+    real_dump = next((p for p in DEFAULT_REAL_CANDIDATES if p.exists()), None)
     if args.input is not None:
         input_path = args.input
-    elif DEFAULT_REAL_INPUT.exists():
-        input_path = DEFAULT_REAL_INPUT
+    elif real_dump is not None:
+        input_path = real_dump
         log.info("Using real Kaggle dump: %s", input_path)
     else:
         input_path = SAMPLE_INPUT
@@ -246,6 +287,7 @@ def main() -> int:
         max_records=args.max_records,
         min_abstract_chars=args.min_abstract_chars,
         categories=args.categories,
+        sample=args.sample,
     )
 
     if df.empty:

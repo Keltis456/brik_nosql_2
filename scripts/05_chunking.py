@@ -203,8 +203,10 @@ def query_local(index: LocalCosineIndex, query_vec: np.ndarray, top_k: int):
     return index.query(query_vec, top_k=top_k, metric="cosine")
 
 
-def index_pinecone(strategy: str, records: list[dict], model, batch_size: int):
+def index_pinecone(strategy: str, records: list[dict], model, batch_size: int, recreate: bool = False):
     """USE_LOCAL=0 path: one Pinecone index per strategy (dim 768, cosine)."""
+    import time
+
     from pinecone import Pinecone, ServerlessSpec
 
     api_key = os.getenv("PINECONE_API_KEY")
@@ -215,6 +217,11 @@ def index_pinecone(strategy: str, records: list[dict], model, batch_size: int):
 
     pc = Pinecone(api_key=api_key)
     existing = [ix["name"] for ix in pc.list_indexes()]
+    if recreate and index_name in existing:
+        log.info("[%s] recreate requested: deleting index '%s' for a clean rebuild...", strategy, index_name)
+        pc.delete_index(index_name)
+        existing = [ix["name"] for ix in pc.list_indexes()]
+
     if index_name not in existing:
         log.info("[%s] creating Pinecone index '%s' (dim=%d, cosine)...", strategy, index_name, model.dim)
         pc.create_index(
@@ -223,8 +230,12 @@ def index_pinecone(strategy: str, records: list[dict], model, batch_size: int):
             metric="cosine",
             spec=ServerlessSpec(cloud=cloud, region=region),
         )
+        for _ in range(30):
+            if pc.describe_index(index_name)["status"]["ready"]:
+                break
+            time.sleep(1)
     else:
-        log.info("[%s] reusing Pinecone index '%s'.", strategy, index_name)
+        log.info("[%s] reusing Pinecone index '%s' (pass --recreate for a clean rebuild).", strategy, index_name)
 
     index = pc.Index(index_name)
 
@@ -283,9 +294,12 @@ def main() -> int:
     parser.add_argument("--sentence-max-words", type=int, default=60, help="Max words per sentence chunk.")
     parser.add_argument("--batch-size", type=int, default=64, help="Embed/upsert batch size.")
     parser.add_argument("--top-k", type=int, default=5, help="Results per query per strategy.")
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Delete and recreate the per-strategy chunk indexes for a clean rebuild.",
+    )
     args = parser.parse_args()
-
-    queries = args.query or DEFAULT_QUERIES
 
     df = pd.read_parquet(args.input)
     # Select the papers with the LONGEST abstracts (by word count).
@@ -297,6 +311,21 @@ def main() -> int:
         int(df["_abs_words"].max()),
         int(df["_abs_words"].min()),
     )
+
+    # Test queries. If none are passed with -q, derive them from the titles of a
+    # few of the SELECTED papers. The chunk demo corpus is ONLY these 30
+    # long-abstract papers, which (with a representative random sample) are
+    # arbitrary topics. Fixed generic queries would rarely match them, so we
+    # query with the selected papers' own titles: this makes the chunk search
+    # meaningful and lets us compare how fixed vs sentence chunking retrieves
+    # the relevant passages.
+    if args.query:
+        queries = args.query
+    else:
+        titles = df["title"].astype(str).tolist()
+        idxs = [0, len(titles) // 2, len(titles) - 1] if len(titles) >= 3 else list(range(len(titles)))
+        queries = [titles[i] for i in idxs]
+        log.info("No -q given; using titles of %d selected papers as demo queries.", len(queries))
 
     model = load_embedding_model()
     log.info("Model: %s (dim=%d)", model.name, model.dim)
@@ -319,7 +348,7 @@ def main() -> int:
         if use_local:
             backends[strategy] = index_local(strategy, records, model, args.batch_size)
         else:
-            backends[strategy] = index_pinecone(strategy, records, model, args.batch_size)
+            backends[strategy] = index_pinecone(strategy, records, model, args.batch_size, recreate=args.recreate)
 
     # ---- run the test queries against each strategy --------------------- #
     print("\n========== CHUNK SEARCH RESULTS ==========")

@@ -77,8 +77,10 @@ def load_local() -> int:
     return 0
 
 
-def load_pinecone(batch_size: int) -> int:
+def load_pinecone(batch_size: int, recreate: bool = False) -> int:
     """Real Pinecone path."""
+    import time
+
     from pinecone import Pinecone, ServerlessSpec
 
     api_key = os.getenv("PINECONE_API_KEY")
@@ -97,6 +99,11 @@ def load_pinecone(batch_size: int) -> int:
     pc = Pinecone(api_key=api_key)
 
     existing = [ix["name"] for ix in pc.list_indexes()]
+    if recreate and index_name in existing:
+        log.info("Recreate requested: deleting existing index '%s' for a clean rebuild...", index_name)
+        pc.delete_index(index_name)
+        existing = [ix["name"] for ix in pc.list_indexes()]
+
     if index_name not in existing:
         log.info("Creating index '%s' (dim=%d, metric=%s)...", index_name, dim, metric)
         pc.create_index(
@@ -105,8 +112,13 @@ def load_pinecone(batch_size: int) -> int:
             metric=metric,
             spec=ServerlessSpec(cloud=cloud, region=region),
         )
+        # Wait until the new index is ready before upserting.
+        for _ in range(30):
+            if pc.describe_index(index_name)["status"]["ready"]:
+                break
+            time.sleep(1)
     else:
-        log.info("Index '%s' already exists; reusing.", index_name)
+        log.info("Index '%s' already exists; reusing (pass --recreate for a clean rebuild).", index_name)
 
     index = pc.Index(index_name)
 
@@ -150,12 +162,17 @@ def load_pinecone(batch_size: int) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--batch-size", type=int, default=200, help="Upsert batch size (Pinecone).")
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Delete and recreate the index for a clean rebuild (drops any stale vectors).",
+    )
     args = parser.parse_args()
 
     use_local = os.getenv("USE_LOCAL", "1") == "1"
     if use_local:
         return load_local()
-    return load_pinecone(args.batch_size)
+    return load_pinecone(args.batch_size, recreate=args.recreate)
 
 
 if __name__ == "__main__":

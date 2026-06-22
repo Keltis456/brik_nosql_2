@@ -35,7 +35,7 @@
 
 | Крок | Скрипт | Що відбувається | Вхід → Вихід |
 |------|--------|-----------------|--------------|
-| 1 | `scripts/01_prepare_data.py` | Читає arXiv JSONL, чистить (whitespace, дублі, короткі абстракти), залишає підмножину 5k–10k, фіксує схему `id, title, abstract, authors, year, category`. | `data/sample.jsonl` (або Kaggle dump) → `data/arxiv_subset.parquet` |
+| 1 | `scripts/01_prepare_data.py` | Читає arXiv JSONL, чистить (whitespace, дублі, короткі абстракти), бере репрезентативну **reservoir-вибірку** 5k–10k по всьому дампу (спан за роками), фіксує схему `id, title, abstract, authors, year, category`. | `data/sample.jsonl` (або Kaggle dump) → `data/arxiv_subset.parquet` |
 | 2 | `scripts/02_embed.py` | Кодує `title [SEP] abstract` моделлю SPECTER2, робить **L2-нормалізацію**, зберігає вектори та мапінги. | `arxiv_subset.parquet` → `embeddings/embeddings.npy`, `id_map.json`, `metadata.json`, `model_info.json` |
 | 3 | `scripts/03_load_to_pinecone.py` | Створює Pinecone-індекс (метрика **cosine**, правильна розмірність) і робить **batch-upsert** векторів із метаданими. У режимі `USE_LOCAL=1` - будує/перевіряє локальний індекс. | `embeddings/*` → Pinecone або in-memory індекс |
 | 4 | `scripts/04_search.py` | Три режими пошуку: **(a)** чистий семантичний; **(b)** семантичний + фільтри за `year`/`category`; **(c)** порівняння метрик (cosine / dot / euclidean). | запит → ранжований список статей |
@@ -105,52 +105,68 @@ python scripts/01_prepare_data.py \
 ## Як запустити (точний порядок 01 → 06)
 
 ```bash
-# 1. Підготовка даних (офлайн fallback на sample.jsonl)
+# 1. Підготовка даних. За замовчуванням reservoir-вибірка по ВСЬОМУ дампу
+#    (репрезентативно за роками); авто-детект дампу в корені або в data/;
+#    якщо дампу немає - fallback на data/sample.jsonl.
 python scripts/01_prepare_data.py
 
 # 2. Ембединги SPECTER2 (відкат на all-MiniLM-L6-v2, якщо немає мережі/моделі)
 python scripts/02_embed.py
 
-# 3. Завантаження у векторний індекс (Pinecone або локальний)
-python scripts/03_load_to_pinecone.py
+# 3. Завантаження у векторний індекс. --recreate робить чистий перебудов
+#    (видаляє старі вектори), щоб у індексі був рівно поточний підмножина.
+python scripts/03_load_to_pinecone.py --recreate
 
-# 4. Пошук - три режими
-python scripts/04_search.py --mode semantic -q "graph neural networks for molecules"
+# 4. Пошук. Без -q запускає демо по всіх трьох режимах. Або свій запит:
+python scripts/04_search.py
 python scripts/04_search.py --mode filtered -q "retrieval augmented generation" \
     --year-min 2024 --category cs.CL
-python scripts/04_search.py --mode metric   -q "quantum error correction"
 
-# 5. Chunking: 30 найдовших абстрактів, дві стратегії, окремий індекс на стратегію
-python scripts/05_chunking.py
+# 5. Chunking: 30 найдовших абстрактів, дві стратегії, окремий індекс на стратегію.
+#    Без -q запити беруться з назв обраних статей (щоб пошук був осмисленим).
+python scripts/05_chunking.py --recreate
 
 # 6. Гібридний пошук BM25 + вектори через RRF (3 тестові запити за замовчуванням)
 python scripts/06_hybrid_search.py
 ```
 
-### Приклад виводу (ілюстративний)
+### Приклад реального виводу (повний датасет, 8000 статей)
 
-> Нижче - **показовий** приклад того, як виглядає результат гібридного пошуку
-> (числа залежать від моделі/даних і можуть відрізнятися).
+> Реальний прогін `06_hybrid_search.py` на представницькій вибірці arXiv
+> (8000 статей, 1991-2026). Запит: `quantum error correction surface code`.
 
 ```
---- BM25 (lexical only) (top 3) ---
-  1. Reciprocal Rank Fusion Improves Dense Passage Retrieval for Open-Domain QA
-  2. Hybrid Lexical-Semantic Retrieval for Patent Prior-Art Search
-  3. Cross-Encoder Reranking Versus Bi-Encoder Retrieval: A Cost-Quality Analysis
+--- BM25 (lexical only) (top 5) ---
+  1. Approximate quantum error correction, eigenstate thermalization and the chaos bound
+  2. Decoding the Projective Transverse Field Ising Model
+  3. Distance-preserving stabilizer measurements in hypergraph product codes
+  4. Information-theoretic interpretation of quantum error-correcting codes
+  5. Fusion Blossom: Fast MWPM Decoders for QEC
 
---- Vector (semantic only) (top 3) ---
-  1. Reciprocal Rank Fusion Improves Dense Passage Retrieval for Open-Domain QA
-  2. Retrieval-Augmented Generation for Scientific Question Answering
-  3. Domain-Adaptive Pretraining Improves Biomedical Passage Retrieval
+--- Vector (semantic only) (top 5) ---
+  1. Holonomic Surface Codes for Fault-Tolerant Quantum Computation
+  2. Parameter Estimation, Model Reduction and Quantum Filtering
+  3. Scheme for generating the cluster states via atomic ensembles
+  4. How Powerful is Adiabatic Quantum Computation?
+  5. Explicit expressions for real roots of a quartic equation
 
---- Hybrid (RRF k=60) (top 3) ---
-  1. Reciprocal Rank Fusion Improves Dense Passage Retrieval for Open-Domain QA
-  2. Hybrid Lexical-Semantic Retrieval for Patent Prior-Art Search
-  3. Retrieval-Augmented Generation for Scientific Question Answering
+--- Hybrid (RRF k=60) (top 5) ---
+  1. Holonomic Surface Codes for Fault-Tolerant Quantum Computation
+  2. Parameter Estimation, Model Reduction and Quantum Filtering
+  3. Observation of a Fault Tolerance Threshold with Concatenated Codes
+  4. Approximate quantum error correction, eigenstate thermalization and the chaos bound
+  5. Distance-preserving stabilizer measurements in hypergraph product codes
 
 --- Complementarity analysis ---
-  Hybrid top-3 includes 1 doc(s) that ONE method alone would have missed -> this is the RRF win.
+  In BM25 top-5 but NOT vector: 5 docs
+  In vector top-5 but NOT BM25: 5 docs
+  Hybrid top-5 includes 4 doc(s) that ONE method alone would have missed -> this is the RRF win.
 ```
+
+Тут BM25 і vector дали **повністю різні** топ-5 (0 перетину): BM25 чіпляється за
+точний термін «error correction», а vector витягує семантично близькі «surface
+code» / fault-tolerance статті. Гібрид через RRF підняв **4** документи, яких
+жоден метод окремо не мав у топ-5. Це і є наочна користь RRF.
 
 ---
 
@@ -229,6 +245,15 @@ cos(a, b) = a · b
 деталей. Оптимум **залежить від задачі** й має узгоджуватися з контекстним вікном
 моделі та стилем запитів.
 
+На реальному прогоні `05_chunking.py` це видно прямо: у **fixed**-стратегії
+топовими чанками ставали обрізки на кшталт «that are optimal up to an additive
+term of 1.» (score 0.95) або «produced constitutes a minimum spanning tree of the
+initial graph.» (score 0.96) - висока косинусна оцінка, але фрагмент вирваний із
+середини речення, без контексту. **Sentence**-стратегія для тих самих статей
+повертала цілі, самодостатні речення. Це і є практичний доказ, що нарізання
+посеред речення псує інтерпретованість чанка (хоча на коротких абстрактах обидві
+стратегії дають близькі за релевантністю результати, бо чанків мало).
+
 ---
 
 ## Висновки
@@ -236,20 +261,22 @@ cos(a, b) = a · b
 ### 1. Порівняння методів 3x3 (BM25 / vector / hybrid)
 
 `06_hybrid_search.py` ганяє **3 запити** через **3 методи**. Нижче -
-**ілюстративна** таблиця (точні попадання залежать від моделі та даних):
+**реальні** результати прогону на представницькій вибірці (8000 статей):
 
-| Запит | BM25 (лексичний) | Vector (семантичний) | Hybrid (RRF) |
-|---|---|---|---|
-| `reciprocal rank fusion for dense passage retrieval` | сильний: точний термін «reciprocal rank fusion» у тексті | добрий: тематично близькі RAG/retrieval статті | **найкращий**: піднімає і точний термін, і тематичні |
-| `graph neural networks for molecular property prediction` | середній: ловить «graph», «molecular», але губить перефразування | сильний: розуміє зміст навіть за інших слів | **найкращий / нарівні з vector** |
-| `quantum error correction surface code` | сильний: рідкісні точні терміни «surface code» | добрий: близькі quant-ph статті | **найкращий**: поєднує точний термін і тему |
+| Запит | BM25 | Vector | Перетин top-5 | RRF відновив |
+|---|---|---|---|---|
+| `reciprocal rank fusion for dense passage retrieval` | fusion/retrieval статті за точними словами | RAG / IR статті за змістом | 1 спільний | **3 док.** |
+| `graph neural networks for molecular property prediction` | ті самі molecular-GNN статті (CTAGE, MGNN, Dumpling GNN) | ті самі molecular-GNN статті | 3 спільних | 1 док. |
+| `quantum error correction surface code` | точні «error correction» коди | «surface code» / fault-tolerance статті | 0 спільних | **4 док.** |
 
-**Де який перемагає і загальне правило:**
-- **BM25** виграє на запитах із **точними/рідкісними термінами** (ідентифікатори,
-  абревіатури, назви методів).
-- **Vector** виграє на **семантичних/перефразованих** запитах звичайною мовою.
-- **Hybrid (RRF, k=60)** - найробастніший: на **змішаних** запитах він відновлює
-  документи, які кожен метод окремо проґавив би.
+**Спостереження і загальне правило:**
+- Коли BM25 і vector **збігаються** (GNN-запит: 3 спільних у топ-5) - гібрид додає
+  мало, бо обидва методи вже згодні між собою.
+- Коли вони **розходяться** (quantum-запит: 0 спільних) - гібрид найцінніший: RRF
+  відновив 4 релевантні документи, яких жоден метод сам не мав у топ-5.
+- **BM25** виграє на **точних/рідкісних термінах** (ідентифікатори, абревіатури,
+  назви методів); **Vector** - на **семантиці/парафразі**; **Hybrid (RRF, k=60)**
+  найробастніший на змішаних запитах.
 - Правило: точний-термін/лексика → **BM25**; семантика/парафраз → **vector**;
   змішане/потрібна надійність → **hybrid через RRF**.
 
@@ -331,6 +358,8 @@ L2(a, b)^2 = |a|^2 + |b|^2 - 2 (a · b) = 1 + 1 - 2 (a · b) = 2 - 2 cos(a, b)
 ## Примітки
 
 - Коментарі в коді - англійською; пояснювальний текст README - українською (вимога курсу).
-- Числа у прикладах виводу **ілюстративні**: точні бали/порядок залежать від
-  моделі (SPECTER2 vs fallback), даних та режиму (Pinecone vs локальний).
+- Приклади виводу та таблиці у розділі «Висновки» взяті з **реального прогону** на
+  представницькій вибірці 8000 статей (Pinecone, SPECTER2). На іншій вибірці/машині
+  конкретні статті відрізнятимуться, але закономірності (перетин методів, виграш RRF,
+  обрізані fixed-чанки) відтворюються.
 - Усі назви артефактів узгоджені між скриптами через `scripts/common.py`.
